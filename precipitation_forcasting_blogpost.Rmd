@@ -1,0 +1,492 @@
+---
+title: "An Evaluation of 4 Ways to Forecast Precipitation Time Series with Annual Seasonality"
+author: "Clayton Glasser"
+date: "December 31, 2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+The purpose of this experiment is to compare 4 methods of creating a 1-year-out forecast of precipitation levels based on data that consists of daily measurements of precipitation volume over a 10-year period from a single location. Additional dimensions of data are assumed unavailable, so multiple linear regression based techniques are not an option. However each measurement is associated with a date; therefore, it can can be treated as a univariate time series. 
+
+Time series are often found in econometrics and finance, where their dynamics can be very different than those found in a hydrological context, where calendar dates and cultural phenomena have little influence. Numerous methods exist for analysing and forecasting time series. The ones chosen for this experiment were chosen partially on the basis on their ability to handle the unique characteristics of this precipitation data -- particularly the long seasonal period of 365 days, which exceeds the computational capacity of some common time series related functions, which were designed with the smaller frequencies relevant to cultural data in mind, e.g. monthly (12) and quarterly (4). 
+
+The precipitation data contains 365 measurements per cycle repetition (technically, the average length of a year is 365.25, because of leap years, but it is treated as 356 here). The primary seasonal cycle associated with this precipitation data is an annual cycle correlating to the intensification of rainfall which zeniths in winter and nadirs in summer. 
+
+The four methods of analysis and forecasting evaluated here are:
+
+* Seasonal ARIMA
+* Holt-Winters Seasonal Exponential Smoothing
+* Non-seasonal ARIMA with a Fourier transform as an exogenous covariate
+* Christiano-Fitzgerald finite data approximation to the ideal time series bandpass filter
+
+The results of these techniques are evaluated relative to each other by measuring the root mean squared error (RMSE) of 1-year forecasts of the 10th year of a data (out-of-sample) based on training sets of data consisting of the first 9 years of data, as well as of the training data itself (in-sample). 
+
+# Data Preparation 
+
+## Required Packages
+
+This project requires the following R packages: multiple packages found in the `tidyverse` package, including `dplyr` (piping), `ggplot2` (plotting), and `readr` (file reading); `forecast` is used for time series creation and forecasting; `mfilter` for the creation of band pass filters; `lubridate` for date management; `tseries` for testing functions. 
+
+```{r, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(mFilter)
+library(lubridate)
+library(tseries)
+
+```
+
+## Read in the Data
+
+The data used here has already been tidied up and wrangled into an efficient structure. `X1` is an index. `Date` contains the calendar date of the measurement. `water_date` contains the equivalent hydrological date to the calendar date (rainfall chronology runs Oct-Sep). `PRCP` contains the precipitation volume measurement. 
+
+```{r, warning=FALSE}
+dat <- read_csv("US1ORLA0076.csv")
+head(dat)
+```
+
+## Visualize the raw data
+
+```{r}
+ggplot(dat, aes(water_date, PRCP)) + 
+  geom_point() +
+  scale_x_date(date_labels = "%b %y", date_breaks = "6 months", date_minor_breaks = "3 months") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+A few interesting qualities are clear upon visual inspection. 
+
+Because rainfall frequently does not occur, but is always additive when it does, many of the data points are 0 or very close to 0, but never go below 0.
+
+There is a clear presence of at least one seasonal cycle corresponding to the length of one year, repeated 10 times, once for each of the 10 years. Intra-annual cycles may exist but are not visibly apparent. 
+
+The data appears highly stochastic, modulating sharply between large and small values.
+
+# Data Transformation
+
+The following techniques are predicated on the understanding of our data as comprised of “signals” and “noise”. The signal components are abstractions of the literal data into simplified shapes that represent it’s essential form or constituent forms. In this case, the signals will be linear regressions of the data’s long-term trend and short-term cycles. The "remainder" component is every aspect of the data that is not represented by these linear regressions. If the signals are perfectly captured, the remainder will be perfectly Gaussian noise; if they are not, some signal will remain in the remainder and it will not be perfectly Gaussian.
+
+To aid in the process of identifying the constituent signals, we first apply two forms of non-destructive and reversible transformation to the data, which compresses it down a less complex expression, with a more essential shape, which will improve model selection.
+
+## Standardization
+
+Subtract the mean and divide by standard deviation.
+
+```{r}
+dat$prcp_scaled <- scale(dat$PRCP)
+```
+
+## Normalization 
+
+We use the inverse hyperbolic sin function as the preferred method to log-transform data with many zeros, which this data has because rainfall has a natural valence of zero.
+
+```{r}
+dat$prcp_log <- log(dat$prcp_scaled + sqrt(dat$prcp_scaled ^ 2 + 1))
+```
+
+### Visualize the transformed data
+
+After standardization, the data is essentially z-scores, and the scale no longer represents the absolute quantity of precipitation (blue), but the value of the data's deviation from the mean (black). Thus, some measurements register below zero even though sub-zero quantities of rainfall are not possible. 
+
+```{r}
+ggplot() + 
+  geom_point(data=dat, aes(water_date, prcp_log, colour="Transformed"),alpha = 0.33) +
+  geom_point(data=dat, aes(water_date, PRCP, colour="Original"), alpha = 0.33) +
+  scale_x_date(date_labels = "%b %y", date_breaks = "6 months", date_minor_breaks = "3 months")  +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_colour_manual(name="Data Iteration", values=c(Original="blue", Transformed="black")) +
+  ylab("Precipitation") + xlab("Time")
+```
+
+# Create time series object
+
+Most of the analyses and forecasting methods used below require time series objects as inputs, so we construct one using the transformed data which spans a precisely 10 year long period, with a frequency of 365, as a close approvimation of the technically accurate 365.25. 
+
+```{r}
+dat_transformed_ts <- ts(dat$prcp_log, start=c(2007, 10), end=c(2017, 9), frequency = 365) 
+plot(dat_transformed_ts)
+```
+
+# Forecasting with ARIMA
+
+ARIMA models are the most general class of models for forecasting those time series which can be made to be “stationary” by differencing. A stationary series is defined as having no trend (long term statistically significant incline or decline) and varying at a constant amplitude around its mean, which means that its autocorrelations (correlations with its own prior deviations from the mean) remain constant over time. Time series of this form can be viewed as a combination of signal and noise, with the signal(s) being a pattern of fast or slow mean reversion (sinusoidal oscillation), or rapid alternation in sign. An ARIMA model can be viewed as a “filter” that tries to separate the signal from the noise, and the signal is then extrapolated into the future to obtain forecasts.
+
+The acronym ARIMA stands for Auto-Regressive Integrated Moving Average. Lags of the stationarized series in the forecasting equation are called "autoregressive" terms (AR), lags of the forecast errors are called "moving average" terms (MA), and a time series which needs to be differenced to be made stationary is said to be an "integrated" version of a stationary series (I). Exponential smoothing models, which are explored in the following section, are special cases of ARIMA models.
+
+The ARIMA forecasting equation for a stationary time series is a linear (i.e., regression-type) equation in which the predictors consist of lags of the dependent variable and/or lags of the forecast errors.
+
+
+## Build ARIMA model
+
+### Decompose the Time Series
+
+Decompose the time series into seasonal, trend and irregular (remainder, noise) components using loess, available in the `stl()` function of `forecast`.
+
+```{r}
+dat_decomp1 = stl(dat_transformed_ts, s.window = "periodic")
+plot(dat_decomp1)
+```
+
+We can see by inspecting the plot of decomposed elements that a clear annual seasonal pattern has been detected, but it seems that some degree of seasonality is visible in the residuals, meaning that the LOESS process has not completely extracted the signal, and has left some of it behind in the remainder, which would ideally be white noise.
+
+It is also interesting to note the substantial dip in the trend component around 2013, which makes sense, as this precipitation data is from coastal Oregon, and 2013 was the driest year on record for large parts of the west coast of the US: https://www.wunderground.com/blog/weatherhistorian/driest-year-on-record-for-california-oregon-wettest-in-asheville-ma.html
+
+### Deseasonalize the series by extracting the identified trend and seasonality
+
+```{r}
+dat_deseasonal1 <- seasadj(dat_decomp1) 
+plot(dat_deseasonal1)
+```
+
+The resulting data is what will be fed into the ARIMA filter. As expected, there appears to be some seasonal information still present in this data, suggesting our prediction will be naive. 
+
+### Testing for stationarity
+
+The augmented Dickey–Fuller test (ADF) tests the null hypothesis that a unit root is present in a time series sample. The alternative hypothesis is trend-stationarity.
+
+```{r, warning=FALSE}
+adf.test(dat_deseasonal1, alternative = "stationary") 
+```
+
+The test concludes that the data is stationary, meaning no differencing will be required for this ARIMA model, or in other words, the I term of the ARIMA model will be of order 0. 
+
+### Testing for autocorrelation
+
+It is usually not possible to tell from a time plot what values of p (AR) and q (MA) are appropriate for the data. However, it is sometimes possible to use the ACF plot, and the closely related PACF plot, to estimate appropriate values for p and q.
+
+The ACF plot is a bar chart of the coefficients of correlation between a time series and lags of itself. The PACF plot is a plot of the partial correlation coefficients between the series and lags of itself.
+
+```{r}
+Acf(dat_deseasonal1, main='',lag.max=1000)
+Pacf(dat_deseasonal1, main='',lag.max=1000)
+```
+
+Autocorrelation still present, with exponentially diminishing lags appearing at the beginning of the series, suggesting the forecasting may be aided by at least one AR term, and possibly more. 
+
+### Using auto.arima to automatically select optimal ARIMA p and q terms. 
+
+The `auto.arima` function from the R’s `forecast` package estimates the ARIMA model using maximum likelihood estimation (MLE) which finds the values of the parameters which maximise the probability of obtaining the data that we have observed. In practice, R will report the value of the log likelihood of the data; that is, the logarithm of the probability of the observed data coming from the estimated model.
+
+```{r}
+dat_arima1 <- auto.arima(dat_deseasonal1, seasonal=FALSE, approximation = FALSE) 
+dat_arima1 
+```
+
+`auto.arima()` asserts an ARIMA model with the expected one AR term, no differencing, and two MA terms: ARIMA(1,0,2). This could also be referred to as an ARMA model, since there is no I (d) term. 
+
+If we inspect the residuals present in the ARIMA model, we can get a sense for how much of the signal it has captured. 
+
+```{r}
+checkresiduals(dat_arima1)
+```
+
+Pattern visible in the residuals time plot, lag spikes at the beginning of the frequency in the ACF plot, and the non-Gaussian shape of the parametrically measured residuals all suggest some correlation, or signal, is not captured by the model. 
+
+### Forecasting using decomposition by LOESS and auto.arima modeling
+
+#### Plot WITHOUT extracted seasonality
+```{r}
+plot(forecast(dat_arima1, h=365)) 
+```
+
+#### Plot WITH extracted seasonality
+```{r}
+dat_arima1_w_seas <- auto.arima(dat_deseasonal1, seasonal=TRUE, approximation = FALSE) #create ARIMA model
+plot(forecast(dat_arima1_w_seas, h=365)) #plot forecast
+```
+
+The forecast both with and without seasonality incorporated is very naive, apparently just a projection of the mean. I believe this is because the `auto.arima()` function will allow a seasonal period up to 350 (not 365) but in practice will usually run out of memory when the seasonal period is more than about 200.  
+
+### Testing forecast made with seasonal decomposition by LOESS and auto.arima
+
+This forecast isn’t going to win any competitions, but we’ll measure the root mean squared error so we can compare it to the following methods. 
+
+```{r}
+# Training set - 9 years
+dat_train1 <- subset(dat_deseasonal1, start = 1, end = 3287)
+plot(dat_train1)
+
+# Test set - 1 year
+dat_test1 <- subset(dat_deseasonal1, start = 3288, end = 3652)
+plot(dat_test1)
+
+# Fit the model
+dat_train1_arima <- auto.arima(dat_train1, seasonal=TRUE, approximation = FALSE)
+
+# Forecast using the model 
+dat_fcast_test1 <- forecast(dat_train1_arima,h=365, seasonal=TRUE, approximation = FALSE)
+plot(dat_fcast_test1, col="black") 
+lines(dat_test1,col="red") 
+
+# Evaluating RMSE of forecast
+accuracy(dat_fcast_test1,dat_test1)
+```
+
+# Holt-Winters Seasonal Exponential Smoothing
+
+If the data has no trend or seasonal components, simple exponential smoothing can be used for forecasting. If the data has a linear trend component, Holt's linear method or the damped method can be used. However, if the data is seasonal, as this data is, the Holt-Winters method becomes useful. The Holt-Winters (H-W) method is based on three smoothing equations; one each for level, trend, and seasonality. It is an extension of Holt's linear method, but there are two H-W methods depending on whether seasonality is modeled in an additive or multiplicative way. The triplet ETS  refers to error, trend, and seasonality (in that order) and each of these component is assigned a mode from the selection of possibilities: “additive”, “multiplicative”, or “none”. 
+
+If you call `forecast` directly on a time series object, it will select an ETS model automatically and then return the forecast. Estimation is handled via maximizing the likelihood of the data given to the model, where minimizing the AIC gives the best model for prediction. It works by applying each of 30 smoothing methods that are appropriate to the data, estimating parameters and initial values using MLE, and selecting best method using AIC.
+
+```{r}
+dat_ets1 <- stl(dat_transformed_ts,s.window="periodic")
+plot(forecast(dat_ets1, h=365))
+```
+
+`forecast()` suggests an exponential smoothing model with error, trend and seasonality terms of "additive", "none", and "none" respectively (ETS(A,N,N)).
+
+Compared the other methods tested here, this method reflects more short term dynamics, and produces a more precise forecast. 
+
+### Testing seasonal exponential smoothing with additive errors
+
+```{r}
+# Training set - 9 years
+dat_train2 <- subset(dat_deseasonal1, start = 1, end = 3287)
+
+# Test set - 1 year
+dat_test2 <- subset(dat_deseasonal1, start = 3288, end = 3652)
+
+# Fit the model
+dat_train2_ets <- stl(dat_train2,s.window="periodic")
+
+# Forecast using the model 
+dat_fcast_test2 <- forecast(dat_train2_ets,h=365)
+plot(dat_fcast_test2, col="black") 
+lines(dat_test2,col="red") 
+
+# Evaluate RMSE of forecast
+accuracy(dat_fcast_test2,dat_test2)
+```
+
+# ARIMA for long seasonality using a Fourier transform as an exogenous covariate
+
+It is a challenge to fit ARIMA or ETS model with data having a long seasonal period, such as 365 for daily data, seasonal versions of ARIMA and ETS models are designed for shorter periods such as 12 for monthly data or 4 for quarterly data. The problem is that there are m−1 parameters to be estimated for the initial seasonal states where m is the seasonal period. So for large m, the estimation becomes almost impossible. 
+
+For such data one can use a Fourier series approach where the seasonal pattern is modelled using Fourier terms with short-term time series dynamics allowed in the error, although in this case the seasonality is assumed to be fixed, i.e. the pattern is not allowed to change over time.
+
+### Build ARIMA with fourier term
+
+To do this, we include a Fourier transform in the model as an exogenous covariate. The value of K specifies the number of sine and cosine terms to return for each of the seasonal periods. We wish to capture one annual seasonal cycle, so we execute one Fourier term.
+
+```{r}
+dat_arima_fourier <- auto.arima(dat_transformed_ts, seasonal=FALSE, approximation = FALSE, xreg=fourier(dat_transformed_ts, K=1)) #build model using auto.arima
+checkresiduals(dat_arima_fourier) #inspect the residuals
+plot(forecast(dat_arima_fourier, h=365, xreg=fourier(dat_transformed_ts, K=1, h=365))) #plot the resulting forecast
+```
+
+This forecast looks like a pretty good abstraction of the basic annual seasonal cycle projected into the future. 
+
+### Testing ARIMA for long seasonality using fourier transform as exogenous covariate. 
+
+```{r}
+# Training set - 9 years
+dat_train3 <- subset(dat_transformed_ts, start = 1, end = 3287)
+
+# Test set - 1 year
+dat_test3 <- subset(dat_transformed_ts, start = 3288, end = 3652)
+
+# Fit the model
+dat_train_fourier <- auto.arima(dat_train3, approximation = FALSE, seasonal=FALSE, xreg=fourier(dat_train3, K=1))
+
+# Forecast using the model 
+dat_fcast_test3 <- forecast(dat_train_fourier,h=365, xreg=fourier(dat_test3 , K=1))
+plot(dat_fcast_test3, col="black") 
+lines(dat_test3,col="red") 
+
+# Evaluate RMSE of forecast
+accuracy(dat_fcast_test3,dat_test3)
+```
+
+# Christiano-Fitzgerald band pass filter
+
+The Christiano-Fitzgerald filter is a finite data approximation to the ideal bandpass filter. Several band-pass approximation strategies can be selected in the function `cffilter`. The default setting of cffilter returns the filtered data yˆt associated with the unrestricted optimal filter assuming no unit root, no drift and an iid filter. 
+
+Band pass filters work by combining high pass filters and low pass filters in order to pass frequencies that occur in a defined band or range. High frequency signal components occur when there is relatively small change in value between successive data points; low frequency signal components are occur when there is a relatively large change in value between successive data points. Here we use the filter to remove both high-frequency information and low frequency information in order to isolate two distinct signal components: one corresponding to annual seasonality, and another for long term trend.
+
+## Isolate trend-cycle
+
+If the frequency we want to isolate corresponds to the length of the total measurement period, we want to filter out faster frequencies (changes occurring over the course of any period of time smaller than a year) and set the lower pass limit as low as possible. A band pass range of 366-3652 should result in a lower-range band that corresponds to frequencies as high as 1 year long and as low as 10 years long, i.e. the domain of the entire measurement period. 
+
+```{r}
+dat_cffilter_trend  <- cffilter(dat$prcp_log,pl=366,pu=3652,root=FALSE,drift=FALSE,
+                                        type=c("asymmetric"),
+                                        nfix=1,theta=1)
+plot(dat_cffilter_trend) 
+```
+
+## Subtract trend-cycle
+
+We remove the trend signal component before isolating the seaosnal signal component.
+
+```{r}
+dat_detrended <- (dat$prcp_log - dat_cffilter_trend$cycle)
+```
+
+## Isolate seasonal-cycle from de-trended data
+
+If the frequency we want to isolate corresponds to the length of an annual season, we want to filter out faster frequencies (changes occurring over the course of days or weeks) and slower frequencies (gradual change over the course of multiple years). A band pass range of 180-365 should result in a higher-range band that corresponds to frequencies as high as 6 months long and as low as 1 year long, i.e. the domain of a single annual season. 
+
+```{r}
+dat_cffilter_seas  <- cffilter(dat_detrended,pl=180,pu=365,root=FALSE,drift=FALSE,
+                                       type=c("asymmetric"),
+                                       nfix=1,theta=1)
+plot(dat_cffilter_seas) 
+```
+
+## Vizuale trend and seasonal cycle frequencies
+```{r}
+plot(dat$prcp_log, xlab="Days", ylab="Precipitation")
+lines(dat_cffilter_trend$cycle, col="red", lwd = 2)
+lines(dat_cffilter_seas$cycle, col="blue", lwd = 2)
+legend(1, 3, legend=c("Trend", "Season"),
+       col=c("red", "blue"), lty=1:1, cex=1, lwd = 2)
+
+```
+
+## Forecasting with CF Band Pass Method
+
+```{r, warning=FALSE}
+# convenience dataframe containing trend, seasonal, and date vectors
+dat_cycles <- data.frame(Date=as.Date(dat$water_date),
+                                Seasonal=dat_cffilter_seas$cycle, 
+                                Trend=dat_cffilter_trend$cycle) 
+```
+
+### Inspect trend for stationarity
+
+We do not believe we need the trend-cycle extracted using the low-frequency band pass filter in order to construct the average annual seasonal cycle and forecast it (because we already concluded that the series is trend-stationary and therefore the trend will not influence the forecast), but we can use this different approach to analysis to test our assumption that the trend is stationary. 
+
+```{r, warning=FALSE}
+ggplot(dat_cycles, aes(Date, Trend)) + 
+  geom_point() +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year", minor_breaks = NULL) +
+  theme(axis.text.x = element_text(hjust = 0)) + 
+  geom_smooth(alpha = 0.25, size=1, method = "lm", se = FALSE) # Plot the trend-cycle 
+
+adf.test(dat_cycles$Trend)
+kpss.test(dat_cycles$Trend) #p-values of < 0.05 indicate the trend is stationary
+```
+
+Our assumption that the trend is stationary is confirmed. 
+
+### Construct 10-year average annual seasonal cycle
+
+The forecasting technique associated with this method will consists of identifying the 10 exisitng annual-seasonal cycles, regressing them to an average shape, and projecting this as a forecast. 
+
+```{r, warning=FALSE}
+# Create a vector composed of the seasonal cycle for each of 10 year averaged into one
+dat_seas_avg <- dat_cycles %>%
+  mutate(date_hydro = ymd(paste(
+    if_else(month(Date) < 10, 2017, 2016),
+    month(Date), day(Date)))) %>%
+  group_by(date_hydro) %>%
+  summarize(multiyearmean = mean(Seasonal))
+
+# Backtransform standardization and normalization
+dat_seas_backtrans <- dat_seas_avg 
+
+# (inverse normalization)  inverse of the inverse hyperbolic sine function is the hyperbolic sine function
+dat_seas_backtrans$multiyearmean_sinh <- sinh(dat_seas_backtrans$multiyearmean) 
+
+# (inverse standardization) backtransforming log using the attributes of original scale() output
+dat_seas_backtrans$multiyearmean_unscale <- dat_seas_backtrans$multiyearmean_sinh * attr(dat$prcp_scaled, 'scaled:scale') + attr(dat$prcp_scaled, 'scaled:center')
+
+# Plot of backtransformed seasonal avg
+ggplot(dat_seas_backtrans, aes(date_hydro, multiyearmean_unscale)) + 
+  geom_point() +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month", minor_breaks = NULL) +
+  theme(axis.text.x = element_text(hjust = 0))
+```
+
+### Testing the bandpass-derived forecast
+
+```{r}
+# Convenience object containing only time and precipitation variables
+dat_observations <- dat %>% ungroup() %>% select(water_date, PRCP)
+
+# Create training and testing sets
+dat_train4 <- dat_observations[c(1:3288),c(1:2)]
+dat_test4 <- dat_observations[c(3289:3653),c(1:2)]
+
+# Create seasonal average
+dat_bandpass_forecast <- dat_seas_backtrans %>% select(date_hydro, multiyearmean_unscale) %>% 'colnames<-'(c("water_date", "PRCP"))
+
+# Visualize forecast compared to observations
+plot(dat_train4, col="black") 
+lines(dat_test4,col="red") 
+lines(dat_bandpass_forecast,col="blue")
+
+# Test forecast accuracy
+
+dat_bandapass_fcast_ts <- ts(dat_bandpass_forecast$PRCP, start=c(2016, 10), end=c(2017, 9), frequency = 365) #forecast 
+dat_observed_ts <- ts(dat_test4$PRCP, start=c(2016, 10), end=c(2017, 9), frequency = 365) #observed data from forecast period
+
+accuracy(dat_bandapass_fcast_ts,dat_observed_ts)
+```
+
+# Forecast Accuracy Comparison
+
+We now compare the accuracy of each forecast method. The `accuracy()` function of the `forecast` package will return accuracy evaluations for both in-sample and out-of-sample data if both are provided. 
+
+```{r, message=FALSE}
+## Seasonal ARIMA 
+arima1_acc <- accuracy(dat_fcast_test1,dat_test1)
+arima1_acc
+
+## Holt-Winters Exponential Smoothing
+ets_acc <- accuracy(dat_fcast_test2,dat_test2)
+ets_acc
+
+## Non-Seasonal ARIMA with Fourier Term
+arima2_acc <- accuracy(dat_fcast_test3,dat_test3)
+arima2_acc
+
+## Christiano-Fitzgerlad Bandpass Filter
+cffilter_acc <- accuracy(dat_bandapass_fcast_ts,dat_observed_ts)
+cffilter_acc
+```
+
+## Plot the accuracy results
+
+From the plot we can see that the Holt-Winters Seasonal Exponential Smoothing method outperformed all of the other methods on both the in-sample and out-of-sample data sets, except for the ARIMA with Fourier term method, which outperformed it on the out-of-sample data set only. H-W exponential smoothing also admits of the largest performance discrepancy between in-sample and out-of-sample forecast performance, of the three pairs recorded. 
+
+```{r, warning=FALSE}
+#convert a`ccuracy()` results to dataframes
+acc1 = data.frame(arima1_acc)
+acc2 = data.frame(ets_acc)
+acc3 = data.frame(arima2_acc)
+acc4 = data.frame(cffilter_acc)
+acc4$MASE <- NA
+acc4 <- rbind(acc4, "Training set" = c(NA,NA,NA,NA,NA,NA,NA,NA))
+
+#combine dataframes into a list
+lsAcc = list(acc1, acc2, acc3, acc4)
+dfAcc = do.call(what = rbind, args = lsAcc)
+dfAcc$rowPair = ceiling(1:8 * 0.5)
+
+#plot training set and testing set RMSE for each method 
+plot(0, cex=0, xlim=c(1,4), ylim=c(0,1))
+points(x = dfAcc$rowPair[grepl(pattern = "Training", rownames(dfAcc))], 
+       y = dfAcc$RMSE[grepl(pattern = "Training", rownames(dfAcc))],
+       pch = 2, col="blue")
+points(x = dfAcc$rowPair[grepl(pattern = "Test", rownames(dfAcc))], 
+       y = dfAcc$RMSE[grepl(pattern = "Test", rownames(dfAcc))],
+       pch = 3, col="red")
+```
+
+# Conclusion
+
+This experiment is concluded by asserting that, of the four methods tested here, based on the data utilized and the assumptions held in the preceding arguments, the Holt-Winters Seasonal Exponential Smoothing technique produced the overall most accurate and appropriate 1-year-out forecast of precipitation levels. 
+
+## Areas for Improvement
+
+There are certianly a number of ways this inquiry could be improved to be more precise, universal, and conclusive. 
+
+In the future, k-fold cross-validation should be explored as a superior means of measuring out-of-sample accuracy.
+
+Other measurments of goodness-of-fit besides RMSE, such as mean absolute scaled error (MASE) could also be evaluated and may yield meaningfully different results. 
+
+Analysing a more voluminous data set may also improve the accuracy of these conclusions. For example, over a longer time scale, non-stationarity may become evident.
+
+It is also worth noting that the characteristic patterns of the rainfall recorded in this data set are not represented accross all climates and areas and that these technqiues may perform differently in different contexts. It would be instructive to compare the results on these same analysis and forecasting methods accross multiple, morphologicaly dissimilar precipitation data sets. 
